@@ -5,6 +5,7 @@ Run the Goa day-ahead forecast from the command line (for a 07:00 daily schedule
     python daily_forecast.py --data Goa_Historical_data.xlsx --out forecasts --weather --holidays 2026-11-09,2026-11-10
 
 Before it runs, the workbook must contain the current day filled up to 06:45 (or complete days only).
+Weather: --weather (ECMWF) and/or --ncmrwf-file <csv> (temperature, humidity, rain, wind).
 Output: goa_dayahead_<date>.csv and .xlsx (96 blocks: forecast, P10, P90) plus goa_dayahead_latest.csv
 """
 import argparse
@@ -20,7 +21,13 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data", required=True, help="path to the Goa historical workbook")
     p.add_argument("--out", default="forecasts", help="output folder")
-    p.add_argument("--weather", action="store_true", help="add Open-Meteo weather (needs internet)")
+    p.add_argument("--weather", action="store_true",
+                   help="add ECMWF IFS temperature/humidity/rain/wind via Open-Meteo (needs internet, non-commercial licence)")
+    p.add_argument("--ecmwf-model", default="ecmwf_ifs025", help="ecmwf_ifs025 (~25 km) or ecmwf_ifs (~9 km)")
+    p.add_argument("--ncmrwf-file", default=None,
+                   help="CSV/Excel with NCMRWF NCUM-G 12 km hourly point series at Goa (must cover history and the forecast day)")
+    p.add_argument("--ncmrwf-local-time", action="store_true", help="NCMRWF file times are already local (default: UTC)")
+    p.add_argument("--weather-cache", default="weather_cache", help="folder for cached ECMWF history")
     p.add_argument("--lat", type=float, default=15.50)
     p.add_argument("--lon", type=float, default=73.83)
     p.add_argument("--holidays", default="", help="comma separated extra holiday dates YYYY-MM-DD")
@@ -38,12 +45,25 @@ def main():
         sys.exit(2)
 
     hols = tuple(pd.Timestamp(x.strip()) for x in a.holidays.split(",") if x.strip())
-    weather = None
+    sources = {}
     if a.weather:
         try:
-            weather = fc.fetch_weather(a.lat, a.lon, load.index[0].date(), (target + pd.Timedelta(days=1)).date())
+            sources["ecmwf"] = fc.fetch_ecmwf_cached(a.weather_cache, a.lat, a.lon, load.index[0].date(),
+                                                     (target + pd.Timedelta(days=1)).date(), a.ecmwf_model)
         except Exception as e:
-            print(f"WARNING: weather unavailable ({e}); continuing without it.", file=sys.stderr)
+            print(f"WARNING: ECMWF weather unavailable ({e}).", file=sys.stderr)
+    if a.ncmrwf_file:
+        try:
+            sources["ncmrwf"], notes = fc.load_weather_file(a.ncmrwf_file, a.ncmrwf_file,
+                                                            assume_utc=not a.ncmrwf_local_time)
+            print("NCMRWF file:", "; ".join(notes))
+        except Exception as e:
+            print(f"WARNING: could not read NCMRWF file ({e}).", file=sys.stderr)
+    weather = None
+    if sources:
+        weather, notes = fc.combine_weather(sources, target)
+        for n in notes:
+            print("Weather:", n, file=sys.stderr if "not used" in n else sys.stdout)
 
     counts = load.resample("D").count()
     bt_end = counts[counts == fc.BLOCKS].index[-1]
