@@ -336,11 +336,17 @@ def build_features_issue(load: pd.Series, hol_daily: pd.Series, weather: pd.Data
 
     if weather is not None:
         w = weather.reindex(idx)
-        f["temp"] = w["temp"]
-        f["humidity"] = w["humidity"]
-        f["rain"] = w["rain"]
-        f["temp_24h_mean"] = w["temp"].rolling(BLOCKS, min_periods=8).mean()
-        f["heat_index"] = w["temp"] + 0.1 * w["humidity"]
+        for v in ("temp", "humidity", "rain", "wind", "temp_spread", "rain_spread", "wind_spread"):
+            if v in w and w[v].notna().any():
+                f[v] = w[v]
+        if "temp" in f:
+            f["temp_24h_mean"] = w["temp"].rolling(BLOCKS, min_periods=8).mean()
+            f["temp_72h_mean"] = w["temp"].rolling(3 * BLOCKS, min_periods=24).mean()
+            if "humidity" in f:
+                f["heat_index"] = w["temp"] + 0.1 * w["humidity"]
+        if "rain" in f:  # rain is mm/h; one block = 0.25 h
+            f["rain_6h"] = w["rain"].rolling(24, min_periods=4).sum() / 4
+            f["rain_24h"] = w["rain"].rolling(BLOCKS, min_periods=8).sum() / 4
     return f, base
 
 
@@ -395,3 +401,185 @@ def forecast_issue(load: pd.Series, flags, weather, extra_holidays=(), downweigh
         out["p10_mw"] = pred.values * (1 + np.minimum(q10.reindex(fb).values, 0))
         out["p90_mw"] = pred.values * (1 + np.maximum(q90.reindex(fb).values, 0))
     return out, {"issue_day": issue_day, "k": k, "target_day": target, "last_data": load.index[-1]}
+
+
+# =========================================================================== WEATHER SOURCES
+# Parameters used everywhere: temp (degC), humidity (%), rain (mm/h), wind (m/s, 10 m).
+# Sources: ECMWF IFS via Open-Meteo (live API) and NCMRWF NCUM-G 12 km via a file you supply.
+WX_VARS = ("temp", "humidity", "rain", "wind")
+_OM_VARS = {"temperature_2m": "temp", "relative_humidity_2m": "humidity",
+            "precipitation": "rain", "wind_speed_10m": "wind"}
+
+
+def _om_to_df(h: dict) -> pd.DataFrame:
+    df = pd.DataFrame(index=pd.to_datetime(h["time"]))
+    for k, new in _OM_VARS.items():
+        key = k if k in h else next((c for c in h if c.startswith(k)), None)  # multi-model keys carry a suffix
+        df[new] = pd.to_numeric(pd.Series(h[key], index=df.index), errors="coerce") if key else np.nan
+    return df
+
+
+def fetch_ecmwf(lat: float, lon: float, start, end, model: str = "ecmwf_ifs025",
+                tz: str = "Asia/Kolkata") -> pd.DataFrame:
+    """Hourly ECMWF IFS fields from Open-Meteo: archived forecasts for past days (no look-ahead from
+    analysis), live forecast for today onwards. Open-Meteo is free for NON-COMMERCIAL use only."""
+    import requests
+
+    start, end = pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize()
+    today = pd.Timestamp.now().normalize()
+    hourly = ",".join(_OM_VARS)
+    base = {"latitude": lat, "longitude": lon, "hourly": hourly, "models": model,
+            "wind_speed_unit": "ms", "timezone": tz}
+    parts = []
+    hist_end = min(end, today - pd.Timedelta(days=1))
+    cur = start
+    while cur <= hist_end:
+        stop = min(cur + pd.Timedelta(days=364), hist_end)
+        r = requests.get("https://historical-forecast-api.open-meteo.com/v1/forecast", timeout=120,
+                         params={**base, "start_date": cur.date().isoformat(), "end_date": stop.date().isoformat()})
+        r.raise_for_status()
+        parts.append(_om_to_df(r.json()["hourly"]))
+        cur = stop + pd.Timedelta(days=1)
+    if end >= today:
+        fd = int(max(2, min(16, (end - today).days + 2)))
+        r = requests.get("https://api.open-meteo.com/v1/forecast", timeout=60,
+                         params={**base, "past_days": 1, "forecast_days": fd})
+        r.raise_for_status()
+        parts.append(_om_to_df(r.json()["hourly"]))
+    if not parts:
+        raise ValueError("no ECMWF data requested")
+    w = pd.concat(parts)
+    return w[~w.index.duplicated(keep="last")].sort_index()  # forecast API wins on overlap
+
+
+def fetch_ecmwf_cached(cache_dir, lat, lon, start, end, model="ecmwf_ifs025", tz="Asia/Kolkata") -> pd.DataFrame:
+    """Same as fetch_ecmwf but keeps settled (past) days in a CSV so each run only downloads the new days."""
+    from pathlib import Path
+
+    folder = Path(cache_dir)
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"ecmwf_{model}_{lat:.2f}_{lon:.2f}.csv"
+    start, end = pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize()
+    today = pd.Timestamp.now().normalize()
+    cached = pd.read_csv(path, index_col=0, parse_dates=True) if path.exists() else None
+    if cached is not None and len(cached) and cached.index[0] <= start + pd.Timedelta(days=1):
+        fetch_from = max(start, cached.index[-1].normalize() - pd.Timedelta(days=2))
+    else:
+        cached, fetch_from = None, start
+    new = fetch_ecmwf(lat, lon, fetch_from, end, model, tz)
+    settled = new[new.index < today]
+    merged = pd.concat([cached, settled]) if cached is not None else settled
+    merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+    merged.to_csv(path)
+    out = pd.concat([merged, new[new.index >= today]])
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    return out.loc[start:end + pd.Timedelta(hours=23)]
+
+
+def load_weather_file(src, name: str = "weather.csv", assume_utc: bool = False, tz: str = "Asia/Kolkata"):
+    """Read a point time series (e.g. NCMRWF NCUM-G 12 km extracted at Goa) from CSV/Excel.
+    Needs a time column plus any of: temperature (degC or K), humidity (% or fraction),
+    rain/precipitation (mm per hour), wind speed (m/s) or u10/v10 components.
+    Returns (frame with temp/humidity/rain/wind, notes about unit conversions)."""
+    df = pd.read_csv(src) if str(name).lower().endswith(".csv") else pd.read_excel(src)
+    lc = {c: str(c).strip().lower() for c in df.columns}
+    notes: list[str] = []
+
+    tcol = next((c for c, l in lc.items() if l in ("time", "timestamp", "datetime", "date_time", "valid_time", "date")),
+                df.columns[0])
+    t = pd.to_datetime(df[tcol], errors="coerce")
+    if assume_utc:
+        t = t.dt.tz_localize("UTC").dt.tz_convert(tz).dt.tz_localize(None)
+        notes.append("times converted from UTC to local time")
+    out = pd.DataFrame(index=t)
+
+    def pick(*keys, exact=()):
+        for c, l in lc.items():
+            if c == tcol:
+                continue
+            if l in exact or any(k in l for k in keys):
+                return c
+        return None
+
+    c_t = pick("temp", "t2m", "2t_", "air_temperature", exact=("2t", "tas", "t_2m", "t"))
+    c_h = pick("humid", exact=("rh", "rh2m", "r2"))
+    c_r = pick("rain", "precip", exact=("tp", "apcp", "prcp"))
+    c_w = pick("windspeed", "wind_speed", "wind speed", exact=("ws", "wspd", "wind", "si10", "w10"))
+    c_u, c_v = pick(exact=("u10", "u10m", "10u", "u_10m")), pick(exact=("v10", "v10m", "10v", "v_10m"))
+
+    def num(c):
+        return pd.to_numeric(df[c], errors="coerce").values
+
+    if c_t:
+        v = num(c_t)
+        if np.nanmedian(v) > 100:
+            v = v - 273.15
+            notes.append("temperature converted from Kelvin")
+        out["temp"] = v
+    if c_h:
+        v = num(c_h)
+        if np.nanmax(v) <= 1.5:
+            v = v * 100
+            notes.append("humidity converted from fraction to %")
+        out["humidity"] = v
+    if c_r:
+        out["rain"] = num(c_r)
+    if c_w:
+        out["wind"] = num(c_w)
+    elif c_u and c_v:
+        out["wind"] = np.sqrt(num(c_u) ** 2 + num(c_v) ** 2)
+        notes.append("wind speed computed from u10/v10")
+    out = out[out.index.notna()].sort_index()
+    out = out[~out.index.duplicated(keep="last")]
+    found = [v for v in WX_VARS if v in out]
+    if not found:
+        raise ValueError("No temperature / humidity / rain / wind columns recognised in the file")
+    notes.append("columns found: " + ", ".join(found))
+    return out, notes
+
+
+def combine_weather(sources: dict, target_day=None):
+    """Merge several sources ({'ecmwf': df, 'ncmrwf': df}) onto a 15-min grid.
+    Returns (frame, notes). Frame has the consensus (mean) of temp/humidity/rain/wind, the spread
+    between sources, and each source's own columns (suffix _<name>) for display only.
+    A source with no data on the forecast day is dropped, so the forecast never runs on blanks."""
+    notes, ready = [], {}
+    for name, df in sources.items():
+        if df is None or not len(df):
+            continue
+        if target_day is not None:
+            td = pd.Timestamp(target_day).normalize()
+            day = df.loc[td: td + pd.Timedelta(hours=23, minutes=59)]
+            if day.dropna(how="all").empty:
+                notes.append(f"{name}: no data for forecast day {td:%d %b} - source not used")
+                continue
+        g = df.resample("15min").mean().interpolate(limit=3)
+        ready[name] = g
+    if not ready:
+        return None, notes
+    idx = sorted(set().union(*[g.index for g in ready.values()]))
+    idx = pd.DatetimeIndex(idx)
+    out = pd.DataFrame(index=pd.date_range(idx.min(), idx.max(), freq="15min"))
+    for v in WX_VARS:
+        cols = []
+        for name, g in ready.items():
+            if v in g:
+                out[f"{v}_{name}"] = g[v].reindex(out.index)
+                cols.append(f"{v}_{name}")
+        if cols:
+            out[v] = out[cols].mean(axis=1)
+            if len(cols) > 1 and v in ("temp", "rain", "wind"):
+                out[f"{v}_spread"] = out[cols].max(axis=1) - out[cols].min(axis=1)
+    notes.append("sources used: " + ", ".join(ready))
+    return out, notes
+
+
+def weather_coverage(w: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for c in w.columns:
+        if c.endswith("_spread"):
+            continue
+        s = w[c].dropna()
+        if len(s):
+            rows.append({"series": c, "from": s.index[0], "to": s.index[-1], "share_filled_%": round(100 * len(s) / len(w), 1)})
+    return pd.DataFrame(rows)
