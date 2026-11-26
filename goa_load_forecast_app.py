@@ -28,9 +28,14 @@ def read_tidy(raw: bytes, name: str, ts_col: str, load_col: str):
     return fc.load_tidy(df, ts_col, load_col)
 
 
-@st.cache_data(show_spinner="Fetching weather (Open-Meteo)...", ttl=3 * 3600)
-def get_weather(lat, lon, start, end):
-    return fc.fetch_weather(lat, lon, start, end)
+@st.cache_data(show_spinner="Fetching ECMWF weather (Open-Meteo)...", ttl=3 * 3600)
+def get_ecmwf(lat, lon, start, end, model):
+    return fc.fetch_ecmwf_cached("weather_cache", lat, lon, start, end, model)
+
+
+@st.cache_data(show_spinner="Reading NCMRWF file...")
+def read_ncmrwf(raw: bytes, name: str, utc: bool):
+    return fc.load_weather_file(io.BytesIO(raw), name, assume_utc=utc)
 
 
 @st.cache_data(show_spinner="Backtesting as if issued each morning...")
@@ -54,11 +59,20 @@ with st.sidebar:
     up = st.file_uploader("Historical load file", type=["xlsx", "xls", "csv"],
                           help="The FY-sheet Goa workbook, or any CSV/Excel with a timestamp and a load column. "
                                "Fill the current day up to 06:45 before the 07:00 run.")
-    st.header("2. Options")
-    use_weather = st.checkbox("Use weather (Open-Meteo)", value=False,
-                              help="Temperature, humidity and rain for the target day. Needs internet.")
+    st.header("2. Weather")
+    use_ecmwf = st.checkbox("ECMWF IFS (live, via Open-Meteo)", value=True,
+                            help="Temperature, humidity, rain and wind speed. Needs internet. "
+                                 "Open-Meteo is free for non-commercial use only.")
+    ecmwf_model = st.selectbox("ECMWF model", ["ecmwf_ifs025", "ecmwf_ifs"],
+                               help="ecmwf_ifs025 = 0.25 deg (~25 km), longer archive. "
+                                    "ecmwf_ifs = ~9 km HRES, archive may be shorter.")
+    ncm_up = st.file_uploader("NCMRWF NCUM-G 12 km point series (CSV / Excel)", type=["csv", "xlsx", "xls"],
+                              help="Hourly series at Goa with a time column and temperature (degC or K), humidity (%), "
+                                   "rain (mm/h) and wind speed (m/s) or u10/v10. Must cover history AND the forecast day.")
+    ncm_utc = st.checkbox("NCMRWF file times are UTC", value=True)
     lat = st.number_input("Latitude", value=15.50, format="%.3f")
     lon = st.number_input("Longitude", value=73.83, format="%.3f")
+    st.header("3. Options")
     downweight = st.checkbox("Down-weight outage / rain-trip days in training", value=True)
     holiday_text = st.text_area("Extra holidays (YYYY-MM-DD, one per line)",
                                 help="Moving festivals (Diwali, Eid, Ganesh Chaturthi...) for the target day and "
@@ -107,12 +121,27 @@ elif k == 0:
 st.caption(f"Data known to **{last_ts:%d %b %H:%M}** ({k} blocks of {issue_day:%d %b} available) "
            f"-> forecast for **{target_day:%A %d %b %Y}**, 96 blocks.")
 
-weather = None
-if use_weather:
+sources, wx_notes = {}, []
+if use_ecmwf:
     try:
-        weather = get_weather(lat, lon, load.index[0].date(), (target_day + pd.Timedelta(days=1)).date())
+        sources["ecmwf"] = get_ecmwf(lat, lon, load.index[0].date(), (target_day + pd.Timedelta(days=1)).date(), ecmwf_model)
     except Exception as e:
-        st.warning(f"Weather unavailable ({e}). Continuing without weather.")
+        st.warning(f"ECMWF weather unavailable ({e}).")
+if ncm_up is not None:
+    try:
+        sources["ncmrwf"], n = read_ncmrwf(ncm_up.getvalue(), ncm_up.name, ncm_utc)
+        wx_notes += [f"NCMRWF file: {x}" for x in n]
+    except Exception as e:
+        st.warning(f"Could not read the NCMRWF file: {e}")
+weather = None
+if sources:
+    weather, n = fc.combine_weather(sources, target_day)
+    wx_notes += n
+    for x in n:
+        if "not used" in x:
+            st.warning(x)
+if weather is None:
+    st.caption("Running without weather data.")
 
 full_days = load.resample("D").count()
 last_full = full_days[full_days == BLOCKS].index[-1]
@@ -132,7 +161,7 @@ c[3].metric(f"Backtest MAPE ({bt_days}d)", f"{m_model['MAPE %']:.1f}%",
             f"{m_model['MAPE %'] - m_naive['MAPE %']:+.1f} pts vs last week", delta_color="inverse")
 c[4].metric("Daily peak error", f"{m_model['Daily peak error %']:.1f}%")
 
-tab1, tab2, tab3, tab4 = st.tabs(["Forecast", "Backtest", "History explorer", "Data & holidays"])
+tab1, tab2, tab5, tab3, tab4 = st.tabs(["Forecast", "Backtest", "Weather", "History explorer", "Data & holidays"])
 
 with tab1:
     hist = load.iloc[-BLOCKS * 3 - k:]
@@ -143,7 +172,8 @@ with tab1:
         fig.add_scatter(x=fcst.index, y=fcst.p10_mw, fill="tonexty", fillcolor="rgba(255,127,14,0.20)",
                         line=dict(width=0), name="P10-P90 band", hoverinfo="skip")
     fig.add_scatter(x=fcst.index, y=fcst.forecast_mw, name="Forecast", line=dict(color="#ff7f0e", width=2))
-    fig.add_vline(x=last_ts, line_dash="dot", line_color="gray")
+    fig.add_shape(type="line", x0=str(last_ts), x1=str(last_ts), y0=0, y1=1, yref="paper",
+                  line=dict(dash="dot", color="gray"))  # "known data ends here" marker
     fig.update_layout(height=470, yaxis_title="MW", hovermode="x unified", legend=dict(orientation="h", y=1.08),
                       margin=dict(t=30))
     st.plotly_chart(fig)
@@ -227,3 +257,50 @@ with tab4:
         st.dataframe(flags.reset_index(), height=360)
     else:
         st.info("No remarks row in this file, so holidays are not learned from history.")
+
+
+with tab5:
+    from plotly.subplots import make_subplots
+
+    if weather is None:
+        st.info("No weather loaded. Enable ECMWF or upload an NCMRWF file in the sidebar.")
+    else:
+        for x in wx_notes:
+            st.caption(x)
+        labels = {"temp": "Temperature (degC)", "humidity": "Humidity (%)", "rain": "Rain (mm/h)", "wind": "Wind speed (m/s)"}
+        day = weather.loc[target_day: target_day + pd.Timedelta(hours=23, minutes=45)]
+        fw = make_subplots(rows=2, cols=2, subplot_titles=list(labels.values()), shared_xaxes=False)
+        for i, v in enumerate(labels):
+            r_, c_ = divmod(i, 2)
+            for col in day.columns:
+                if col.startswith(v + "_") and not col.endswith("spread"):
+                    fw.add_scatter(x=day.index, y=day[col], name=col.split("_", 1)[1], row=r_ + 1, col=c_ + 1,
+                                   line=dict(width=1.5), legendgroup=col.split("_", 1)[1],
+                                   showlegend=(i == 0))
+        fw.update_layout(height=520, title=f"Weather used for the forecast day {target_day:%d %b %Y}",
+                         legend=dict(orientation="h", y=1.12))
+        st.plotly_chart(fw)
+
+        st.subheader("How load relates to weather (history)")
+        dl = load.dropna().resample("D").agg(["mean", "max"])
+        dl.columns = ["load_avg", "load_peak"]
+        dw = pd.DataFrame({
+            "temp": weather["temp"].resample("D").mean() if "temp" in weather else np.nan,
+            "humidity": weather["humidity"].resample("D").mean() if "humidity" in weather else np.nan,
+            "rain_mm": weather["rain"].resample("D").sum() if "rain" in weather else np.nan,
+            "wind": weather["wind"].resample("D").mean() if "wind" in weather else np.nan})
+        j = dl.join(dw, how="inner").dropna()
+        if len(j) > 30:
+            corr = j.corr().loc[["load_avg", "load_peak"], ["temp", "humidity", "rain_mm", "wind"]].round(2)
+            a, b = st.columns([1, 2])
+            a.write("Correlation with daily load")
+            a.dataframe(corr)
+            xv = st.selectbox("Scatter x-axis", ["temp", "humidity", "rain_mm", "wind"])
+            fs = go.Figure(go.Scatter(x=j[xv], y=j.load_avg, mode="markers", marker=dict(size=5, opacity=0.5)))
+            fs.update_layout(height=340, xaxis_title=xv, yaxis_title="Daily average load (MW)", margin=dict(t=20))
+            b.plotly_chart(fs)
+            st.caption("Correlation mixes in seasonal trend and load growth, so treat it as a guide, not a measure of effect.")
+        else:
+            st.info("Not enough overlap between load and weather history yet.")
+        st.subheader("Weather data coverage")
+        st.dataframe(fc.weather_coverage(weather))
